@@ -921,7 +921,7 @@ void initialize_gl4es() {
     // verify WHICH renderer actually loaded (Zomdroid resets the choice on new instances).
     {
         extern void zomdroid_gltrace(const char* fmt, ...);
-        zomdroid_gltrace("INIT ng_gl4es RC53-CHANNELMASK (ETC2 skips gradient alpha and channel-coded masks), noerror=%d",
+        zomdroid_gltrace("INIT ng_gl4es RC54-CONVMEMO-BUDGET (shader conversion memo; memory saver honours LIBGL_SHRINK=0), noerror=%d",
                          globals4es.noerror);
         {
             extern void zomdroid_exit_probe_register(void);

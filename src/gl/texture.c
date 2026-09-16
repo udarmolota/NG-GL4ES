@@ -1122,7 +1122,7 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
     // Already-resident textures stay sharp; when the game's own cache drops us back
     // under the low-water mark, new uploads go back to full size. The visible cost
     // (tile seams on chunks loaded while over budget) is paid only by devices that
-    // would otherwise be killed. LIBGL_TEXBUDGET=<MB>, 0 disables; an explicit
+    // would otherwise be killed. LIBGL_TEXBUDGET=<MB>, 0 disables; a non-zero
     // LIBGL_SHRINK from the user always wins.
     {
         static int zbud_hi = -1, zbud_lo = 0, zbud_on = 0, zbud_manual = 0;
@@ -1135,7 +1135,14 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
             zbud_hi = ze ? atoi(ze) : 0;
             if (zbud_hi < 0) zbud_hi = 0;
             zbud_lo = (zbud_hi > 300) ? zbud_hi - 300 : zbud_hi; // hysteresis
-            zbud_manual = getenv("LIBGL_SHRINK") ? 1 : 0;
+            // A non-zero shrink mode chosen by the user stands the budget down: modes 1 and
+            // 7 already halve at least as much. LIBGL_SHRINK=0 is not such a choice -- it is
+            // how the launcher writes "no shrink" (its presets keep the line and set 0) -- and
+            // counting it as manual disarmed the budget for nearly every NG player: both
+            // saver-on field reports carried LIBGL_SHRINK and logged no TEXBUDGET line at
+            // 1167 and 1835 MB of live textures.
+            const char* zs = getenv("LIBGL_SHRINK");
+            zbud_manual = (zs && atoi(zs) != 0) ? 1 : 0;
         }
         if (zbud_hi > 0 && !zbud_manual) {
             long zlive = zomdroid_glalloc_live_tex() >> 20;

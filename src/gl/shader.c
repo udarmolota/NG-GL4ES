@@ -404,6 +404,102 @@ static void zomdroid_ccache_store(struct shader_s* glshader, const char* orig, s
     else remove(tmp);
 }
 
+// ZOMDROID CONVERSION MEMO (2026-09-16): PZ hands the same source to glShaderSource
+// several times in one session. The three ~22 KB fragment shaders are converted two or
+// three times at 230-690 ms each, and while driving the repeats land mid-game (frames
+// 505..9554 in field traces) -- visible freezes. Within one process the SIMPLE path's
+// output depends only on the source and the shader type (library, driver and probe
+// results cannot change under it), so a repeat restores everything that path writes into
+// the shader: the mutated source, the converted text, the builtin needs and the
+// uniform-defaults table. Memory only: a disk entry would outlive a library or driver
+// update and keep serving the old converter's output. LIBGL_CONVMEMO=0 disables.
+typedef struct zmemo_s {
+    struct zmemo_s* next;
+    GLenum type;
+    size_t olen;
+    char* orig;
+    char* source;
+    char* converted;
+    shaderconv_need_t need;
+    int ndecl;
+    uniform_declaration_s* decl;
+} zmemo_t;
+#define ZMEMO_BUCKETS 256
+#define ZMEMO_MAX_BYTES (32L * 1024 * 1024)
+static zmemo_t* zmemo_tab[ZMEMO_BUCKETS];
+int zmemo_hits = 0, zmemo_entries = 0;
+long zmemo_bytes = 0;
+static int zmemo_enabled(void) {
+    static int zst = -1;
+    if (zst < 0) {
+        const char* e = getenv("LIBGL_CONVMEMO");
+        zst = (e && e[0] == '0') ? 0 : 1;
+    }
+    return zst;
+}
+static zmemo_t* zmemo_find(GLenum type, const char* orig, size_t olen, unsigned long long h) {
+    for (zmemo_t* m = zmemo_tab[h % ZMEMO_BUCKETS]; m; m = m->next)
+        if (m->type == type && m->olen == olen && memcmp(m->orig, orig, olen) == 0) return m;
+    return NULL;
+}
+// Returns 1 when a stored conversion was restored into glshader.
+static int zomdroid_memo_try(struct shader_s* glshader, const char* orig, size_t olen) {
+    if (!zmemo_enabled()) return 0;
+    zmemo_t* m = zmemo_find(glshader->type, orig, olen, zcc_fnv64(orig, olen));
+    if (!m) return 0;
+    char* src = strdup(m->source);
+    char* conv = strdup(m->converted);
+    if (!src || !conv) {
+        free(src);
+        free(conv);
+        return 0;
+    }
+    free(glshader->source);
+    glshader->source = src;
+    free(glshader->converted);
+    glshader->converted = conv;
+    glshader->need = m->need;
+    if (m->ndecl) memcpy(glshader->uniforms_declarations, m->decl, (size_t)m->ndecl * sizeof(uniform_declaration_s));
+    glshader->uniforms_declarations_count = m->ndecl;
+    zmemo_hits++;
+    return 1;
+}
+static void zomdroid_memo_store(struct shader_s* glshader, const char* orig, size_t olen) {
+    if (!zmemo_enabled() || !glshader->converted || !glshader->source) return;
+    unsigned long long h = zcc_fnv64(orig, olen);
+    if (zmemo_find(glshader->type, orig, olen, h)) return;
+    int n = glshader->uniforms_declarations_count;
+    if (n < 0) n = 0;
+    if (n > MAX_UNIFORM_VARIABLE_NUMBER) n = MAX_UNIFORM_VARIABLE_NUMBER;
+    size_t slen = strlen(glshader->source), clen = strlen(glshader->converted);
+    long cost = (long)(sizeof(zmemo_t) + olen + slen + clen + 3 + (size_t)n * sizeof(uniform_declaration_s));
+    if (zmemo_bytes + cost > ZMEMO_MAX_BYTES) return; // a full memo just stops learning
+    zmemo_t* m = (zmemo_t*)calloc(1, sizeof(zmemo_t));
+    if (!m) return;
+    m->orig = (char*)malloc(olen + 1);
+    m->source = strdup(glshader->source);
+    m->converted = strdup(glshader->converted);
+    m->decl = n ? (uniform_declaration_s*)malloc((size_t)n * sizeof(uniform_declaration_s)) : NULL;
+    if (!m->orig || !m->source || !m->converted || (n && !m->decl)) {
+        free(m->orig);
+        free(m->source);
+        free(m->converted);
+        free(m->decl);
+        free(m);
+        return;
+    }
+    memcpy(m->orig, orig, olen + 1);
+    if (n) memcpy(m->decl, glshader->uniforms_declarations, (size_t)n * sizeof(uniform_declaration_s));
+    m->ndecl = n;
+    m->type = glshader->type;
+    m->olen = olen;
+    m->need = glshader->need;
+    m->next = zmemo_tab[h % ZMEMO_BUCKETS];
+    zmemo_tab[h % ZMEMO_BUCKETS] = m;
+    zmemo_bytes += cost;
+    zmemo_entries++;
+}
+
 // ZOMDROID FIX (Mali strictness, wave 4 — field report 2026-07-26): ivec-TYPED
 // EXPRESSIONS in arithmetic with float vectors. PZ's shadow-blur does
 //     min((pixel + ivec2(x, y)) * pixelStep, maxUV)
@@ -2431,11 +2527,13 @@ void APIENTRY_GL4ES gl4es_glShaderSource(GLuint shader, GLsizei count, const GLc
             size_t zcc_olen = strlen(glshader->source);
             char* zcc_orig = (char*)malloc(zcc_olen + 1);
             if (zcc_orig) memcpy(zcc_orig, glshader->source, zcc_olen + 1);
-            int zcc_hit = zcc_orig ? zomdroid_ccache_try(glshader, zcc_orig, zcc_olen) : 0;
+            int zmemo_hit = zcc_orig ? zomdroid_memo_try(glshader, zcc_orig, zcc_olen) : 0;
+            int zcc_hit = zmemo_hit ? 1 : (zcc_orig ? zomdroid_ccache_try(glshader, zcc_orig, zcc_olen) : 0);
             if (zcc_hit) {
                 glshader->is_converted_essl_320 = 0;
                 extern void zomdroid_gltrace(const char* fmt, ...);
-                zomdroid_gltrace("CONVERT cached shader=%u clen=%d", shader, (int)strlen(glshader->converted));
+                zomdroid_gltrace("CONVERT %s shader=%u clen=%d", zmemo_hit ? "memo" : "cached", shader,
+                                 (int)strlen(glshader->converted));
             }
             if (!zcc_hit) {
             ZOMDROID_VDBG("ZOMDROID_DBG: shader=%d path=SIMPLE_SHADERCONV\n", shader);glshader->converted = strip_uniform_initializers(glshader->converted);
@@ -2490,6 +2588,7 @@ void APIENTRY_GL4ES gl4es_glShaderSource(GLuint shader, GLsizei count, const GLc
                                  glshader->converted ? (int)strlen(glshader->converted) : -1, zcms);
             }
             if (zcc_orig) zomdroid_ccache_store(glshader, zcc_orig, zcc_olen);
+            if (zcc_orig) zomdroid_memo_store(glshader, zcc_orig, zcc_olen);
             } // !zcc_hit
             free(zcc_orig);
 

@@ -558,7 +558,6 @@ DBG(SHUT_LOGD("glPopAttrib()\n");)
     }
 
     if (cur->mask & GL_TEXTURE_BIT) {
-        int old_tex = glstate->texture.active;
         int a;
         //TODO: Enable bit for the 4 texture coordinates
         for (a=0; a<hardext.maxtex; a++) {
@@ -574,7 +573,11 @@ DBG(SHUT_LOGD("glPopAttrib()\n");)
                     gl4es_glBindTexture(to_target(j), cur->texture[a][j]);
                 }
         }
-        if (glstate->texture.active!= old_tex) gl4es_glActiveTexture(GL_TEXTURE0+old_tex);
+        /* GL_ACTIVE_TEXTURE belongs to GL_TEXTURE_BIT. Restore the selector
+         * saved by PushAttrib, not the one left by the enclosed rendering.
+         * Otherwise a following BindTexture silently targets the wrong unit. */
+        if (glstate->texture.active != cur->active)
+            gl4es_glActiveTexture(GL_TEXTURE0 + cur->active);
     }
     
 	if (cur->mask & GL_PIXEL_MODE_BIT) {

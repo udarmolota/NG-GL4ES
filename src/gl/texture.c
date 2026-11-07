@@ -1,5 +1,6 @@
 #include "logs.h"
 #include "texture.h"
+#include "zomdroid_etc2.h"
 
 #include "../glx/hardext.h"
 #include "../glx/streaming.h"
@@ -837,6 +838,23 @@ static int get_shrinklevel(int width, int height, int level) {
     int shrink = 0;
     int mipwidth = width << level;
     int mipheight = height << level;
+    // ZOMDROID FLOOR (measured 2026-08-30): shrinking is effectively mandatory on this
+    // renderer, so its visible damage is a product problem rather than a preference --
+    // and the damage lands on SMALL textures. Mode 1 halves everything above one pixel,
+    // which is how it turned the rain droplets to mush. The session histogram says those
+    // textures are not where the memory is: everything with a longest side of 128 or
+    // less accounted for 10 MB of 4285 MB uploaded, a quarter of one percent. So never
+    // shrink them, in any mode. (256 would have cost 24% -- that one stays on the table
+    // only as an explicit quality option.) LIBGL_SHRINKFLOOR overrides the size.
+    {
+        static int zfloor = -1;
+        if (zfloor < 0) {
+            const char* ze = getenv("LIBGL_SHRINKFLOOR");
+            zfloor = ze ? atoi(ze) : 128;
+            if (zfloor < 0) zfloor = 0;
+        }
+        if (mipwidth <= zfloor && mipheight <= zfloor) return 0;
+    }
     switch (globals4es.texshrink) {
     case 0: // nothing
         break;
@@ -1104,7 +1122,7 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
     // Already-resident textures stay sharp; when the game's own cache drops us back
     // under the low-water mark, new uploads go back to full size. The visible cost
     // (tile seams on chunks loaded while over budget) is paid only by devices that
-    // would otherwise be killed. LIBGL_TEXBUDGET=<MB>, 0 disables; an explicit
+    // would otherwise be killed. LIBGL_TEXBUDGET=<MB>, 0 disables; a non-zero
     // LIBGL_SHRINK from the user always wins.
     {
         static int zbud_hi = -1, zbud_lo = 0, zbud_on = 0, zbud_manual = 0;
@@ -1117,7 +1135,14 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
             zbud_hi = ze ? atoi(ze) : 0;
             if (zbud_hi < 0) zbud_hi = 0;
             zbud_lo = (zbud_hi > 300) ? zbud_hi - 300 : zbud_hi; // hysteresis
-            zbud_manual = getenv("LIBGL_SHRINK") ? 1 : 0;
+            // A non-zero shrink mode chosen by the user stands the budget down: modes 1 and
+            // 7 already halve at least as much. LIBGL_SHRINK=0 is not such a choice -- it is
+            // how the launcher writes "no shrink" (its presets keep the line and set 0) -- and
+            // counting it as manual disarmed the budget for nearly every NG player: both
+            // saver-on field reports carried LIBGL_SHRINK and logged no TEXBUDGET line at
+            // 1167 and 1835 MB of live textures.
+            const char* zs = getenv("LIBGL_SHRINK");
+            zbud_manual = (zs && atoi(zs) != 0) ? 1 : 0;
         }
         if (zbud_hi > 0 && !zbud_manual) {
             long zlive = zomdroid_glalloc_live_tex() >> 20;
@@ -1129,6 +1154,157 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
                 zbud_on = 0;
                 globals4es.texshrink = 0;
                 zomdroid_gltrace("TEXBUDGET back under %ldMB <= %dMB — full size restored", zlive, zbud_lo);
+            }
+        }
+    }
+    // ZOMDROID ETC2 (prototype, opt-in via LIBGL_ETC2=1): same eligibility as T16 below,
+    // but instead of 16-bit the pixels are ETC2-encoded at FULL resolution: 4 bytes/px
+    // -> 1 (RGBA8_ETC2_EAC) or 0.5 (opaque -> RGB8_ETC2). The upload goes through our own
+    // glCompressedTexImage2D, whose generic branch passes non-DXT formats straight to
+    // the driver with full bookkeeping. ES3-only (ETC2 is core there). Textures built
+    // by sub-uploads are never taken (data==NULL creations skip this), and a later
+    // glTexSubImage2D into an ETC2 texture is refused + logged, not silently corrupted.
+    //
+    // Soft alpha stays out (2026-09-09, "rain and fog visible inside buildings" with ETC2
+    // on). Measured against an exact model of our EAC search: a block of hard 0/255 edges
+    // reproduces both exactly, an anti-aliased edge drifts a zero to at most 2, but a
+    // smooth gradient drifts it to 16 -- a 6% floor where the texture should be empty,
+    // which over a full-screen fog or rain layer is plainly visible. Sprite atlases are
+    // hard-edged (models atlases measure 5-10% mid-alpha pixels, all edges) and keep the
+    // 4:1 EAC; textures whose alpha is mostly a gradient (fog 93-100%, vehicle rust and
+    // damage decals 10-90%, blood 38%) take the T16 path instead, where zero is exact.
+    // LIBGL_ETC2_SOFTALPHA=<percent of 0<a<255 pixels> is the cut (default 10);
+    // -1 skips any transparency at all, 100 never skips (the RC50 behaviour).
+    //
+    // Channel-coded masks stay out too (2026-09-10, "red textures at wall seams" on a
+    // PowerVR tester already carrying the texture-unit fix). PZ's cutaway masks
+    // (wallcutaways.png, windowframe_cutaways*.png) are data, not art: red = the cut,
+    // green/blue = door and window frames, and the shaders test channels exactly --
+    // "if (g + b > 0.0) discard;". ETC1 cannot keep a channel at zero: the uniform-block
+    // fast path adds +2 to all three channels, so (255,0,0) comes back (255,2,2) and the
+    // shader throws the wall pixel away. Measured on the real masks through an exact model
+    // of our encoder: 90-92% of the pure-red pixels discarded. A texture whose opaque
+    // pixels are mostly pure R/G/B is such a mask; across all 2805 large textures in
+    // 42.20 exactly the four cutaway masks qualify. They take the T16 path, where 4-bit
+    // channels hold 0 and 255 exactly. LIBGL_ETC2_CHANNELMASK=<percent of opaque pixels
+    // that are pure primaries> is the cut (default 50); 101 never skips.
+    if (data != NULL && target != GL_PROXY_TEXTURE_2D && width > 0 && height > 0 &&
+        type == GL_UNSIGNED_BYTE && (format == GL_RGBA || format == GL_RGB) &&
+        glstate->vao->unpack == NULL && glstate->texture.unpack_row_length == 0 &&
+        glstate->texture.unpack_skip_pixels == 0 && glstate->texture.unpack_skip_rows == 0 &&
+        globals4es.esversion >= 300) {
+        static int zetc2_on = -1;
+        if (zetc2_on < 0) {
+            const char* ze = getenv("LIBGL_ETC2");
+            zetc2_on = ze ? atoi(ze) : 0; // prototype: default OFF
+        }
+        gltexture_t* zeb = glstate->texture.bound[glstate->texture.active][what_target(target)];
+        if (zetc2_on && zeb) {
+            // A base-level TexImage redefines the object. Clear the previous decision first;
+            // otherwise an ETC2 object reused for alpha data would still reject sub-updates.
+            if (level == 0)
+                zeb->zetc2_format = 0;
+            GLenum zfmt = 0;
+            // >= 512x512 (lowered from 1024 on her word 2026-08-31, "дожми 512"): the
+            // 513..1023 band held hundreds of MB in the size histogram. 128..512 stays
+            // uncompressed -- that is UI and close-up art, and the shrink floor territory.
+            if (level == 0 && (long)width * height >= 512L * 512) {
+                if (format == GL_RGB) {
+                    zfmt = 0x9274; // GL_COMPRESSED_RGB8_ETC2
+                } else {
+                    // one pass over alpha: fully opaque -> RGB8_ETC2 (8:1); hard-edged
+                    // -> RGBA8_ETC2_EAC (4:1); gradient alpha -> not ours, see above
+                    static int zsoft_cut = -2;
+                    if (zsoft_cut == -2) {
+                        const char* zs = getenv("LIBGL_ETC2_SOFTALPHA");
+                        zsoft_cut = zs ? atoi(zs) : 10;
+                    }
+                    static int zmask_cut = -2;
+                    if (zmask_cut == -2) {
+                        const char* zm = getenv("LIBGL_ETC2_CHANNELMASK");
+                        zmask_cut = zm ? atoi(zm) : 50;
+                    }
+                    const unsigned char* zp = (const unsigned char*)data;
+                    long zn = (long)width * height;
+                    long zmid = 0, znon = 0, zopq = 0, zprim = 0;
+                    for (long zi = 3, ze = zn * 4; zi < ze; zi += 4) {
+                        unsigned char za = zp[zi];
+                        if (za != 255) {
+                            znon++;
+                            if (za != 0) zmid++;
+                        }
+                        if (za != 0) {
+                            zopq++;
+                            unsigned char zr = zp[zi - 3], zg = zp[zi - 2], zb = zp[zi - 1];
+                            if ((zr == 255 && zg == 0 && zb == 0) || (zg == 255 && zr == 0 && zb == 0) ||
+                                (zb == 255 && zr == 0 && zg == 0))
+                                zprim++;
+                        }
+                    }
+                    int zsoft = (zsoft_cut < 0) ? (znon > 0) : (zmid * 100 > zn * (long)zsoft_cut);
+                    int zmask = (zopq > 0) && (zprim * 100 >= zopq * (long)zmask_cut);
+                    if (zmask) {
+                        static int zmask_log = 0;
+                        if (zmask_log < 6) {
+                            zmask_log++;
+                            zomdroid_gltrace("ETC2 channel-mask %dx%d L%d prim=%ld%% (cut %d) skipped",
+                                             width, height, level, zprim * 100 / zopq, zmask_cut);
+                        }
+                    } else if (znon == 0) {
+                        zfmt = 0x9274; // GL_COMPRESSED_RGB8_ETC2
+                    } else if (!zsoft) {
+                        zfmt = 0x9278; // GL_COMPRESSED_RGBA8_ETC2_EAC
+                    } else {
+                        static int zsoft_log = 0;
+                        if (zsoft_log < 6) {
+                            zsoft_log++;
+                            zomdroid_gltrace("ETC2 soft-alpha %dx%d L%d mid=%ld%% (cut %d) skipped",
+                                             width, height, level, zmid * 100 / zn, zsoft_cut);
+                        }
+                    }
+                }
+            } else if (level > 0 && zeb->zetc2_format) {
+                zfmt = zeb->zetc2_format; // mip chain follows level 0, never mixes
+            }
+            if (zfmt) {
+                size_t zsz = 0;
+                static int zcache_on = -1;
+                if (zcache_on < 0) {
+                    const char* zc = getenv("LIBGL_ETC2CACHE");
+                    zcache_on = zc ? atoi(zc) : 1; // the cache IS the point: default on
+                }
+                const void* zblocks =
+                        zcache_on ? zomdroid_etc2_cached(zfmt, width, height, (const uint8_t*)data,
+                                                         (format == GL_RGB) ? 3 : 4, &zsz)
+                                  : zomdroid_etc2_encode(zfmt, width, height, (const uint8_t*)data,
+                                                         (format == GL_RGB) ? 3 : 4, &zsz);
+                if (zblocks) {
+                    gl4es_glCompressedTexImage2D(target, level, zfmt, width, height, border,
+                                                 (GLsizei)zsz, zblocks);
+                    if (level == 0) {
+                        zeb->zetc2_format = zfmt;
+                        zeb->alpha = (zfmt == 0x9278) ? 1 : 0;
+                        zeb->width = width;
+                        zeb->height = height;
+                        zeb->nwidth = width;
+                        zeb->nheight = height;
+                        zeb->adjustxy[0] = zeb->adjustxy[1] = 1.0f;
+                        zeb->shrink = 0;
+                    }
+                    {
+                        extern void zomdroid_gltrace(const char* fmt, ...);
+                        static int zlog = 0;
+                        if (zlog < 6) {
+                            zlog++;
+                            zomdroid_gltrace("ETC2 %dx%d L%d %s -> %zu bytes (encode total %llums)",
+                                             width, height, level,
+                                             (zfmt == 0x9278) ? "RGBA8_EAC" : "RGB8",
+                                             zsz, (unsigned long long)zomdroid_etc2_total_ms());
+                        }
+                    }
+                    return;
+                }
+                // encoder refused (size cap / OOM): fall through to the normal path
             }
         }
     }
@@ -1911,6 +2087,25 @@ void APIENTRY_GL4ES gl4es_glTexSubImage2D(GLenum target, GLint level, GLint xoff
     }
 
     realize_bound(glstate->texture.active, target);
+
+    // ZOMDROID ETC2: a plain TexSubImage into compressed storage is GL_INVALID_OPERATION;
+    // with noerror forced it would corrupt silently instead. Refuse and say so -- field
+    // data (RC36 sub-upload counter) says PZ re-uploads these atlases whole, so this
+    // line firing at all is itself a finding.
+    {
+        gltexture_t* zeb = glstate->texture.bound[glstate->texture.active][what_target(target)];
+        if (zeb && zeb->zetc2_format) {
+            extern void zomdroid_gltrace(const char* fmt, ...);
+            static int zlog = 0;
+            if (zlog < 6) {
+                zlog++;
+                zomdroid_gltrace("ETC2SUB refused: %dx%d at %d,%d into compressed tex=%u", width,
+                                 height, xoffset, yoffset, zeb->texture);
+            }
+            noerrorShim();
+            return;
+        }
+    }
 
     if (width <= 0 || height <= 0) {
         return;

@@ -19,6 +19,34 @@
 #define DBG(a)
 #endif
 
+// ZOMDROID 1.4.9 scouting: every indexed draw currently unbinds the native EBO and hands the
+// driver a CLIENT-side index pointer (see the white-floor fix below). These counters measure
+// what share of draws could instead keep the native EBO bound and pass an offset:
+// quads = indices rewritten on CPU (ineligible), ebo = a live native EBO existed,
+// direct = non-quads with a live native EBO, inst = indexed instanced (separate path).
+long zdrawmix_total = 0, zdrawmix_quads = 0, zdrawmix_ebo = 0, zdrawmix_direct = 0, zdrawmix_inst = 0;
+extern void zomdroid_gltrace(const char* fmt, ...);
+
+// ZOMDROID EBO-DIRECT (measured 2026-08-30: of 10 458 497 indexed draws in one session,
+// ALL had a live native EBO bound and 9 213 961 -- 88% -- needed no index rewriting).
+// Those draws still read their indices from the CPU shadow and handed the driver a
+// client-side pointer, which forces the driver to copy the indices on every draw. When
+// the data is already in the element buffer, keep that buffer bound and pass the offset
+// instead. Armed by the caller one statement before the call and consumed at the top of
+// glDrawElementsCommon, so it can never leak into a later draw. LIBGL_EBODIRECT=0 disables.
+static const void* zebo_offset = NULL;
+static int zebo_armed = 0;
+long zebo_used = 0;
+long zebo_try_de = 0, zebo_try_dre = 0; // how many draws reach each armable entry point
+static int zebo_enabled(void) {
+    static int z = -1;
+    if (z < 0) {
+        const char* e = getenv("LIBGL_EBODIRECT");
+        z = e ? atoi(e) : 1;
+    }
+    return z;
+}
+
 static GLboolean is_cache_compatible(GLsizei count) {
 #define T2(AA, A, B)                                                                                                   \
     if (glstate->vao->AA != glstate->vao->B.enabled) return GL_FALSE;                                                  \
@@ -316,6 +344,9 @@ GLuint len_indices(const GLushort* sindices, const GLuint* iindices, GLsizei cou
 
 static void glDrawElementsCommon(GLenum mode, GLint first, GLsizei count, GLuint len, const GLushort* sindices,
                                  const GLuint* iindices, int instancecount) {
+    const void* zdirect = zebo_offset;
+    int zdirect_ok = zebo_armed;
+    zebo_armed = 0; // consumed here whatever happens below
     if (glstate->raster.bm_drawing) bitmap_flush();
     DBG(SHUT_LOGD("glDrawElementsCommon(%s, %d, %d, %d, %p, %p, %d)\n", PrintEnum(mode), first, count, len, sindices,
                   iindices, instancecount);)
@@ -454,7 +485,39 @@ if(count>500000) return;
             if (!iindices && !sindices) {
                 pridroid_ng_diag_driver_draw(mode, count, 1);
                 gles_glDrawArrays(mode, first, count);
+            } else if (zdirect_ok && mode_init != GL_QUADS && hardext.esversion > 1) {
+                // the indices are already in the element buffer: bind it and pass the
+                // offset the application gave us, instead of a pointer into the shadow.
+                zdrawmix_total++;
+                zdrawmix_ebo++;
+                zdrawmix_direct++;
+                zebo_used++;
+                GLuint zold = wantBufferIndex(glstate->vao->elements->real_buffer);
+                realize_bufferIndex();
+                pridroid_ng_diag_driver_draw(mode, count, 1);
+                gles_glDrawElements(mode, count, (sindices) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, zdirect);
+                wantBufferIndex(zold);
             } else {
+                zdrawmix_total++;
+                {
+                    int zebo = (glstate->vao->elements && glstate->vao->elements->real_buffer) ? 1 : 0;
+                    if (zebo) zdrawmix_ebo++;
+                    if (mode_init == GL_QUADS) zdrawmix_quads++;
+                    else if (zebo) zdrawmix_direct++;
+                    // threshold counter, not a modulo: this runs on every indexed draw
+                    // and an integer division has no business in that path.
+                    static long zdm_next = 2000000;
+                    if (zdrawmix_total >= zdm_next) {
+                        static int zdm_budget = 20;
+                        zdm_next += 2000000;
+                        if (zdm_budget > 0) {
+                            zdm_budget--;
+                            zomdroid_gltrace("DRAWMIX step: draws=%ld quads=%ld ebo=%ld direct-ok=%ld inst=%ld",
+                                             zdrawmix_total, zdrawmix_quads, zdrawmix_ebo, zdrawmix_direct,
+                                             zdrawmix_inst);
+                        }
+                    }
+                }
                 // ZOMDROID FIX (proven by gl_trace 2026-07-02: 3001/3001 draws failed 0x502 with
                 // native ebo=783 bound): sindices/iindices are CLIENT-side pointers here; with an
                 // EBO natively bound the pointer is treated as an offset -> GL_INVALID_OPERATION
@@ -471,6 +534,7 @@ if(count>500000) return;
             if (!iindices && !sindices)
                 fpe_glDrawArraysInstanced(mode, first, count, instancecount);
             else {
+                zdrawmix_inst++;
                 void* tmp = (sindices ? ((void*)sindices) : ((void*)iindices));
                 GLenum t = (sindices) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
                 fpe_glDrawElementsInstanced(mode, count, t, tmp, instancecount);
@@ -593,6 +657,12 @@ void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint 
 
         return;
     } else {
+        zebo_try_dre++;
+        // ZOMDROID EBO-DIRECT: same shape as glDrawElements -- see the comment there.
+        if (!need_free && zebo_enabled() && glstate->vao->elements && glstate->vao->elements->real_buffer) {
+            zebo_offset = indices;
+            zebo_armed = 1;
+        }
         glDrawElementsCommon(mode, 0, count, end + 1, sindices, iindices, 1);
         if (need_free) free(sindices);
     }
@@ -706,6 +776,15 @@ void APIENTRY_GL4ES gl4es_glDrawElements(GLenum mode, GLsizei count, GLenum type
         free_renderlist(list);
         return;
     } else {
+        // ZOMDROID EBO-DIRECT: eligible only when nothing rewrote the indices (need_free
+        // means they were converted into a scratch array), the element buffer really
+        // exists on the driver side, and we are not building or emulating a list. Armed
+        // immediately before the call so an early return elsewhere cannot leave it set.
+        zebo_try_de++;
+        if (!need_free && zebo_enabled() && glstate->vao->elements && glstate->vao->elements->real_buffer) {
+            zebo_offset = indices;
+            zebo_armed = 1;
+        }
         glDrawElementsCommon(mode, 0, count, 0, sindices, iindices, 1);
         if (need_free) {
             free(sindices);

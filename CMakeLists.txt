@@ -97,6 +97,7 @@ set(C_SRC_FILES
         src/gl/texture_compressed.c
         src/gl/texture_params.c
         src/gl/texture_read.c
+        src/gl/zomdroid_etc2.c
         src/gl/texture_3d.c
         src/gl/uniform.c
         src/gl/vertexattrib.c

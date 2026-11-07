@@ -374,8 +374,11 @@ void initialize_gl4es() {
     glx_init();
 #endif
 
-    // FBO recycling changes the layout allocated by NewGLState(), so read the
-    // option before gl_init() creates the default state.
+    // ZOMDROID FIX (SIGSEGV at glDeleteFramebuffers+124, addr 0xC, field 2026-08-22):
+    // this used to be read AFTER gl_init(). NewGLState() allocates the recycling pool
+    // only when the flag is already set, so with LIBGL_RECYCLEFBO=1 the pool stayed
+    // NULL while the flag read as true, and the first glDeleteFramebuffers dereferenced
+    // glstate->fbo.old->cap -- NULL + 12, exactly the reported fault address.
     env(LIBGL_RECYCLEFBO, globals4es.recyclefbo, "Recycling of FBO enabled");
 
     gl_init();
@@ -918,7 +921,7 @@ void initialize_gl4es() {
     // verify WHICH renderer actually loaded (Zomdroid resets the choice on new instances).
     {
         extern void zomdroid_gltrace(const char* fmt, ...);
-        zomdroid_gltrace("INIT ng_gl4es PRIDROID-FBO1-PATH1-DIAG1 (safe FBO lifecycle, PriDroid paths, draw/state flight recorder), noerror=%d",
+        zomdroid_gltrace("INIT ng_gl4es PRIDROID-FBO1-PATH1-DIAG1+RC54 (safe FBO lifecycle, PriDroid paths, draw/state flight recorder; Zomdroid RC54: shader conversion memo, direct EBO draws, PopAttrib texture unit), noerror=%d",
                          globals4es.noerror);
         {
             extern void zomdroid_exit_probe_register(void);

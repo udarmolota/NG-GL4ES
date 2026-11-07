@@ -517,6 +517,11 @@ const GLubyte* APIENTRY_GL4ES gl4es_glGetString(GLenum name) {
         case GL_MAX_TEXTURE_COORDS:
             *params = hardext.maxtex;
             break;
+        case GL_ACTIVE_TEXTURE:
+            // ActiveTexture is tracked lazily; the driver selector may belong
+            // to an internal operation and is not the application's state.
+            *params = GL_TEXTURE0 + glstate->texture.active;
+            break;
         case GL_PACK_ALIGNMENT:
             *params = glstate->texture.pack_align;
             break;

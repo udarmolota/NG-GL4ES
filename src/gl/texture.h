@@ -164,6 +164,9 @@ typedef struct {
     // ZOMDROID T16: 16-bit format picked for this texture's level 0, reused for its
     // mipmap levels so a texture never mixes widths across its chain.
     GLenum zt16_format, zt16_type;
+    // ZOMDROID ETC2: nonzero = this texture's storage is the given ETC2 internalformat;
+    // mip levels inherit it, and glTexSubImage2D must not write into it blindly.
+    GLenum zetc2_format;
 } gltexture_t;
 
 KHASH_MAP_DECLARE_INT(tex, gltexture_t *);
